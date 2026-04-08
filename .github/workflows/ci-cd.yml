@@ -1,0 +1,132 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Install Docker Compose
+        run: |
+          sudo curl -L "https://github.com/docker/compose/releases/download/v2.22.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose --version
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Run Tests for Admin Service
+        run: |
+          cd Admin/project
+          npm install --no-optional
+          npm test  # Run unit tests for the Admin service
+
+      - name: Run Tests for User Service
+        run: |
+          cd User/project
+          npm install --no-optional
+          npm test  # Run unit tests for the User service
+
+      - name: Build and Push Admin Service
+        run: |
+          cd Admin/project
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/admin-service:latest .  # Build the Admin service image
+          docker push ${{ secrets.DOCKER_USERNAME }}/admin-service:latest  # Push the Admin service image to Docker Hub
+
+      - name: Build and Push User Service
+        run: |
+          cd User/project
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/user-service:latest .  # Build the User service image
+          docker push ${{ secrets.DOCKER_USERNAME }}/user-service:latest  # Push the User service image to Docker Hub
+
+      - name: Build and Push Nginx Service
+        run: |
+          cd nginx
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/nginx-service:latest .  # Build the Nginx image
+          docker push ${{ secrets.DOCKER_USERNAME }}/nginx-service:latest  # Push the Nginx image to Docker Hub
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa  # Add the private key from GitHub secrets
+          chmod 600 ~/.ssh/id_rsa
+          if [ ! -f ~/.ssh/known_hosts ]; then touch ~/.ssh/known_hosts; fi
+          ssh-keyscan -H 34.233.52.146 >> ~/.ssh/known_hosts  # Add EC2 IP to known_hosts
+
+      - name: Test SSH Connection
+        run: |
+          ssh -v -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@34.233.52.146 echo "SSH Connection Successful"
+
+      - name: Clean up Old Docker Containers and Resources
+        run: |
+          ssh -o StrictHostKeyChecking=no ec2-user@34.233.52.146 << 'EOF'
+            docker system prune -f
+            docker volume prune -f
+            docker network prune -f
+          EOF
+
+      - name: Deploy to EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ec2-user@34.233.52.146 << 'EOF'
+            set -e
+            cd ~/environment/microservices
+            docker-compose -f Admin/project/admin-docker-compose.yaml -p admin down || true
+            docker-compose -f User/project/user-docker-compose.yaml -p user down || true
+            docker network rm app-network || true
+            docker network create app-network || true
+            cd Admin/project
+            docker-compose -f admin-docker-compose.yaml -p admin up --build --force-recreate -d
+            cd ../../User/project
+            docker-compose -f user-docker-compose.yaml -p user up --build --force-recreate -d
+            cd ../../nginx
+            docker-compose -f docker-compose.yml -p nginx up --build --force-recreate -d
+            docker network inspect app-network
+            docker ps
+            echo "Simulating an error here!"
+            exit 1  # Force an error to trigger the rollback
+          EOF
+
+      - name: Rollback to Previous Version if Deployment Fails
+        if: failure()
+        run: |
+          echo "Deployment failed, rolling back to previous version."
+          ssh -o StrictHostKeyChecking=no ec2-user@34.233.52.146 << 'EOF'
+            cd ~/environment/microservices
+            git fetch origin  # Fetch latest changes from remote
+            git stash || git commit -am "Saving local changes before rollback"
+            git checkout HEAD~1  # Revert to previous commit (rollback)
+            git push origin main  # Push the reverted commit to GitHub repository
+            docker-compose -f Admin/project/admin-docker-compose.yaml -p admin up --build --force-recreate -d
+            docker-compose -f User/project/user-docker-compose.yaml -p user up --build --force-recreate -d
+            docker-compose -f nginx/docker-compose.yml -p nginx up --build --force-recreate -d
+          EOF
+
+
+      - name: Verify Deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no ec2-user@34.233.52.146 << 'EOF'
+            docker ps
+            docker network inspect app-network
+          EOF
